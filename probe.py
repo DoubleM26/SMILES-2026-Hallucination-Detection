@@ -13,7 +13,10 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 
 
@@ -27,27 +30,12 @@ class HallucinationProbe(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+        self._members = []
+        self._threshold = 0.5
+        self._random_seed = 42
 
     # ------------------------------------------------------------------
     # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
-
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
-
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-
     # ------------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,11 +47,83 @@ class HallucinationProbe(nn.Module):
         Returns:
             1-D tensor of raw (pre-sigmoid) logits.
         """
-        if self._net is None:
-            raise RuntimeError(
-                "Network has not been built yet. Call fit() before forward()."
+        probs = self.predict_proba(x.detach().cpu().numpy())[:, 1]
+        probs = np.clip(probs, 1e-6, 1 - 1e-6)
+        return torch.from_numpy(np.log(probs / (1.0 - probs)).astype(np.float32))
+
+    def _slices(self, n_features):
+        geo_dim = 144
+        if n_features > geo_dim and (n_features - geo_dim) % 3 == 0:
+            block = (n_features - geo_dim) // 3
+            return [
+                (slice(0, block), "lr", 64),
+                (slice(block, 2 * block), "lr", 64),
+                (slice(2 * block, 3 * block), "lr", 64),
+                (slice(3 * block, n_features), "ridge", 16),
+            ]
+        return [(slice(0, n_features), "lr", 64)]
+
+    def _fit_one(self, X, y, model_name, pca_dim):
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+
+        n_components = min(pca_dim, X.shape[1], max(1, len(X) - 1))
+        pca = PCA(n_components=n_components, random_state=self._random_seed)
+        X_pca = pca.fit_transform(X_scaled)
+
+        if model_name == "ridge":
+            model = Ridge(alpha=100.0, random_state=self._random_seed)
+        else:
+            model = LogisticRegression(
+                class_weight="balanced",
+                C=1.0,
+                max_iter=3000,
+                random_state=self._random_seed,
             )
-        return self._net(x).squeeze(-1)
+        model.fit(X_pca, y)
+        return scaler, pca, model, model_name
+
+    def _score_one(self, X, feature_slice, member):
+        scaler, pca, model, model_name = member
+        X_part = X[:, feature_slice]
+        X_pca = pca.transform(scaler.transform(X_part))
+        if model_name == "ridge":
+            return np.clip(model.predict(X_pca), 0.0, 1.0)
+        return model.predict_proba(X_pca)[:, 1]
+
+    def _scores(self, X):
+        scores = [self._score_one(X, feature_slice, member) for feature_slice, member in self._members]
+        return np.mean(np.vstack(scores), axis=0)
+
+    def _best_threshold(self, y, scores):
+        candidates = np.unique(np.concatenate([scores, np.linspace(0.0, 1.0, 501)]))
+        best_t = 0.5
+        best_acc = -1.0
+        for t in candidates:
+            acc = accuracy_score(y, (scores >= t).astype(int))
+            if acc > best_acc:
+                best_acc = acc
+                best_t = float(t)
+        return best_t
+
+    def _oof_threshold(self, X, y):
+        class_counts = np.bincount(y, minlength=2)
+        n_splits = min(5, int(class_counts.min()))
+        if n_splits < 2:
+            return 0.5
+
+        oof = np.zeros(len(y), dtype=np.float32)
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self._random_seed)
+        specs = self._slices(X.shape[1])
+
+        for train_idx, val_idx in splitter.split(X, y):
+            fold_scores = []
+            for feature_slice, model_name, pca_dim in specs:
+                member = self._fit_one(X[train_idx, feature_slice], y[train_idx], model_name, pca_dim)
+                fold_scores.append(self._score_one(X[val_idx], feature_slice, member))
+            oof[val_idx] = np.mean(np.vstack(fold_scores), axis=0)
+
+        return self._best_threshold(y, oof)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         """Train the probe on labelled feature vectors.
@@ -79,34 +139,13 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
-        X_scaled = self._scaler.fit_transform(X)
-
-        self._build_network(X_scaled.shape[1])
-
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.int64)
+        self._threshold = self._oof_threshold(X, y) if len(y) >= 20 else 0.5
+        self._members = []
+        for feature_slice, model_name, pca_dim in self._slices(X.shape[1]):
+            member = self._fit_one(X[:, feature_slice], y, model_name, pca_dim)
+            self._members.append((feature_slice, member))
         return self
 
     def fit_hyperparameters(
@@ -127,21 +166,9 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
-        probs = self.predict_proba(X_val)[:, 1]
-
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
-
-        best_threshold = 0.5
-        best_f1 = -1.0
-        for t in candidates:
-            y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
-                best_threshold = float(t)
-
-        self._threshold = best_threshold
+        X_val = np.asarray(X_val, dtype=np.float32)
+        y_val = np.asarray(y_val, dtype=np.int64)
+        self._threshold = self._best_threshold(y_val, self.predict_proba(X_val)[:, 1])
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -169,10 +196,7 @@ class HallucinationProbe(nn.Module):
             estimated probability of the hallucinated class (label 1).
             Used to compute AUROC.
         """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
+        X = np.asarray(X, dtype=np.float32)
+        prob_pos = np.clip(self._scores(X), 0.0, 1.0)
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
 
